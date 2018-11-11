@@ -11,6 +11,7 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    MutableMapping,
     MutableSequence,
     Optional,
     Sequence,
@@ -28,20 +29,21 @@ from scipy.ndimage.filters import gaussian_filter
 from scipy.stats import scoreatpercentile
 from skimage import exposure
 from skimage import img_as_float32, img_as_uint
-from slicedimage import Reader, TileSet, Writer
+from slicedimage import Reader, Tile, TileSet, Writer
 from slicedimage.io import resolve_path_or_url
 from tqdm import tqdm
 
 from starfish.errors import DataFormatWarning
 from starfish.experiment.builder import build_image, TileFetcher
 from starfish.experiment.builder.defaultproviders import OnesTile, tile_fetcher_factory
-from starfish.imagestack import indexing_utils
-from starfish.imagestack import physical_coordinate_calculator
+from starfish.imagestack import indexing_utils, physical_coordinate_calculator
+from starfish.imagestack.tileset import TileKey, TileSetData
 from starfish.intensity_table.intensity_table import IntensityTable
 from starfish.multiprocessing.shmem import SharedMemory
 from starfish.types import (
     Coordinates,
     Indices,
+    Number,
     PHYSICAL_COORDINATE_DIMENSION,
     PhysicalCoordinateTypes,
 )
@@ -94,16 +96,19 @@ class ImageStack:
         save the (potentially modified) image tensor to disk
     """
 
-    def __init__(self, image_partition: TileSet) -> None:
-        self._image_partition = image_partition
-        self._tile_shape = image_partition.default_tile_shape
+    def __init__(self, tileset: TileSet) -> None:
+        self._num_rounds = ImageStack._get_dimension_size(tileset, Indices.ROUND)
+        self._num_chs = ImageStack._get_dimension_size(tileset, Indices.CH)
+        self._num_zlayers = ImageStack._get_dimension_size(tileset, Indices.Z)
+        self._tile_metadata = TileSetData(tileset)
+        self._tile_shape = tileset.default_tile_shape
 
         # Examine the tiles to figure out the right kind (int, float, etc.) and size.  We require
         # that all the tiles have the same kind of data type, but we do not require that they all
         # have the same size of data type. The # allocated array is the highest size we encounter.
         kind = None
         max_size = 0
-        for tile in tqdm(self._image_partition.tiles()):
+        for tile in tqdm(tileset.tiles()):
             dtype = tile.numpy_array.dtype
             if kind is None:
                 kind = dtype.kind
@@ -127,7 +132,7 @@ class ImageStack:
 
             for axis_name, axis_data in AXES_DATA.items():
                 if ix == axis_data.order:
-                    size_for_axis = self._get_dimension_size(axis_name)
+                    size_for_axis = ImageStack._get_dimension_size(tileset, axis_name)
                     dim_for_axis = axis_name
                     break
 
@@ -170,7 +175,7 @@ class ImageStack:
         )
 
         # iterate through the tiles and set the data.
-        for tile in self._image_partition.tiles():
+        for tile in tileset.tiles():
             h = tile.indices[Indices.ROUND]
             c = tile.indices[Indices.CH]
             zlayer = tile.indices.get(Indices.Z, 0)
@@ -827,14 +832,15 @@ class ImageStack:
         """
 
         data: collections.defaultdict = collections.defaultdict(list)
+        keys = self._tile_metadata.keys()
         index_keys = set(
-            key
-            for tile in self._image_partition.tiles()
-            for key in tile.indices.keys())
+            key.value
+            for key in AXES_DATA.keys()
+        )
         extras_keys = set(
             key
-            for tile in self._image_partition.tiles()
-            for key in tile.extras.keys())
+            for tilekey in keys
+            for key in self._tile_metadata[tilekey].keys())
         duplicate_keys = index_keys.intersection(extras_keys)
         if len(duplicate_keys) > 0:
             duplicate_keys_str = ", ".join([str(key) for key in duplicate_keys])
@@ -842,17 +848,23 @@ class ImageStack:
                 f"keys ({duplicate_keys_str}) was found in both the Tile specification and extras "
                 f"field. Tile specification keys may not be duplicated in the extras field.")
 
-        for tile in self._image_partition.tiles():
-            for k in index_keys:
-                data[k].append(tile.indices.get(k, None))
-            for k in extras_keys:
-                data[k].append(tile.extras.get(k, None))
+        for indices in self._iter_indices({Indices.ROUND, Indices.CH, Indices.Z}):
+            tilekey = TileKey(
+                round=indices[Indices.ROUND],
+                ch=indices[Indices.CH],
+                z=indices[Indices.Z])
+            extras = self._tile_metadata[tilekey]
 
-            if 'barcode_index' not in tile.extras:
-                round_ = tile.indices[Indices.ROUND]
-                ch = tile.indices[Indices.CH]
-                z = tile.indices.get(Indices.Z, 0)
-                barcode_index = (((z * self.num_rounds) + round_) * self.num_chs) + ch
+            for index, index_value in indices.items():
+                data[index.value].append(index_value)
+
+            for k in extras_keys:
+                data[k].append(extras.get(k, None))
+
+            if 'barcode_index' not in extras:
+                barcode_index = ((((indices[Indices.Z]
+                                    * self.num_rounds) + indices[Indices.ROUND])
+                                  * self.num_chs) + indices[Indices.CH])
 
                 data['barcode_index'].append(barcode_index)
 
@@ -904,23 +916,24 @@ class ImageStack:
                                                               indices=indices,
                                                               physical_axis=physical_axis)
 
-    def _get_dimension_size(self, dimension: Indices):
+    @staticmethod
+    def _get_dimension_size(tileset: TileSet, dimension: Indices):
         axis_data = AXES_DATA[dimension]
-        if dimension in self._image_partition.dimensions or axis_data.required:
-            return self._image_partition.get_dimension_shape(dimension)
+        if dimension in tileset.dimensions or axis_data.required:
+            return tileset.get_dimension_shape(dimension)
         return 1
 
     @property
     def num_rounds(self):
-        return self._get_dimension_size(Indices.ROUND)
+        return self._num_rounds
 
     @property
     def num_chs(self):
-        return self._get_dimension_size(Indices.CH)
+        return self._num_chs
 
     @property
     def num_zlayers(self):
-        return self._get_dimension_size(Indices.Z)
+        return self._num_zlayers
 
     @property
     def tile_shape(self):
@@ -936,22 +949,57 @@ class ImageStack:
         tile_opener : TODO ttung: doc me.
 
         """
-        for tile in self._image_partition.tiles():
-            h = tile.indices[Indices.ROUND]
-            c = tile.indices[Indices.CH]
-            zlayer = tile.indices.get(Indices.Z, 0)
-            tile.numpy_array, axes = self.get_slice(
-                indices={Indices.ROUND: h, Indices.CH: c, Indices.Z: zlayer}
-            )
-            assert len(axes) == 0
-
+        tileset = TileSet(
+            dimensions={
+                Indices.ROUND,
+                Indices.CH,
+                Indices.Z,
+                Indices.Y,
+                Indices.X,
+            },
+            shape={
+                Indices.ROUND: self.num_rounds,
+                Indices.CH: self.num_chs,
+                Indices.Z: self.num_zlayers,
+            },
+            default_tile_shape=self._tile_shape,
+            extras=self._tile_metadata.extras,
+        )
         seen_x_coords, seen_y_coords, seen_z_coords = set(), set(), set()
-        for tile in self._image_partition.tiles():
-            seen_x_coords.add(tile.coordinates[Coordinates.X])
-            seen_y_coords.add(tile.coordinates[Coordinates.Y])
-            z_coords = tile.coordinates.get(Coordinates.Z, None)
-            if z_coords is not None:
-                seen_z_coords.add(z_coords)
+        for round_ in range(self.num_rounds):
+            for ch in range(self.num_chs):
+                for zlayer in range(self.num_zlayers):
+                    tilekey = TileKey(round=round_, ch=ch, z=zlayer)
+                    extras: dict = self._tile_metadata[tilekey]
+
+                    tile_indices = {
+                        Indices.ROUND: round_,
+                        Indices.CH: ch,
+                        Indices.Z: zlayer,
+                    }
+
+                    coordinates: MutableMapping[Coordinates, Tuple[Number, Number]] = dict()
+                    x_coordinates = self.coordinates(tile_indices, Coordinates.X)
+                    y_coordinates = self.coordinates(tile_indices, Coordinates.Y)
+                    z_coordinates = self.coordinates(tile_indices, Coordinates.Z)
+
+                    seen_x_coords.add(x_coordinates)
+                    coordinates[Coordinates.X] = x_coordinates
+                    seen_y_coords.add(y_coordinates)
+                    coordinates[Coordinates.Y] = y_coordinates
+                    if z_coordinates[0] != np.nan and z_coordinates[1] != np.nan:
+                        coordinates[Coordinates.Z] = z_coordinates
+                        seen_z_coords.add(z_coordinates)
+
+                    tile = Tile(
+                        coordinates=coordinates,
+                        indices=tile_indices,
+                        extras=extras,
+                    )
+                    tile.numpy_array, _ = self.get_slice(
+                        indices={Indices.ROUND: round_, Indices.CH: ch, Indices.Z: zlayer}
+                    )
+                    tileset.add_tile(tile)
 
         sorted_x_coords = sorted(seen_x_coords)
         sorted_y_coords = sorted(seen_y_coords)
@@ -990,7 +1038,7 @@ class ImageStack:
         if not filepath.endswith('.json'):
             filepath += '.json'
         Writer.write_to_path(
-            self._image_partition,
+            tileset,
             filepath,
             pretty=True,
             tile_opener=tile_opener)
